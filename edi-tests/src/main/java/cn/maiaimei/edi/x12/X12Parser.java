@@ -1,81 +1,131 @@
 package cn.maiaimei.edi.x12;
 
-import cn.maiaimei.validation.ValidationMessages;
-import cn.maiaimei.validation.ValidationType;
 import com.google.common.collect.Maps;
-import java.util.HashMap;
+import java.util.ArrayDeque;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Optional;
 import org.apache.commons.lang3.StringUtils;
 
 @SuppressWarnings("unchecked")
 public class X12Parser {
 
-  private static final String INTERCHANGE = "Interchange";
+  private static final String INTERCHANGE_CONTROL_HEADER_TAG = "ISA";
+  private static final String INTERCHANGE_CONTROL_TRAILER_TAG = "IEA";
+  private static final String FUNCTIONAL_GROUP_HEADER_TAG = "GS";
+  private static final String FUNCTIONAL_GROUP_TRAILER_TAG = "GE";
+  private static final String TRANSACTION_SET_HEADER_TAG = "ST";
+  private static final String TRANSACTION_SET_TRAILER_TAG = "SE";
+  private static final Map<String, String> KEY_MAP = Maps.newHashMap();
+
+  static {
+    KEY_MAP.put(INTERCHANGE_CONTROL_HEADER_TAG, "InterchangeList");
+    KEY_MAP.put(FUNCTIONAL_GROUP_HEADER_TAG, "FunctionalGroupList");
+    KEY_MAP.put(TRANSACTION_SET_HEADER_TAG, "TransactionSetList");
+  }
 
   private final String segmentSeparator;
   private final String elementSeparator;
-  private final String subElementSeparator;
-  private final ValidationMessages validationMessages;
+  private final Map<String, String> loopConfig;
 
-  public X12Parser(String segmentSeparator, String elementSeparator, String subElementSeparator) {
-    if (StringUtils.isBlank(segmentSeparator)) {
-      this.segmentSeparator = System.lineSeparator();
-    } else {
-      this.segmentSeparator = segmentSeparator;
-    }
+  public X12Parser(String segmentSeparator, String elementSeparator,
+      Map<String, String> loopConfig) {
+    this.segmentSeparator = segmentSeparator;
     this.elementSeparator = elementSeparator;
-    this.subElementSeparator = subElementSeparator;
-    this.validationMessages = ValidationMessages.newInstance();
+    this.loopConfig = Optional.ofNullable(loopConfig).orElseGet(Maps::newLinkedHashMap);
   }
 
-  public ValidationMessages getValidationMessages() {
-    return validationMessages;
-  }
-
-  public Map<String, Object> parse(String content) {
-    Map<String, Object> result = Maps.newLinkedHashMap();
-    final String[] segments = StringUtils.split(content, segmentSeparator);
-    if (Objects.isNull(segments)) {
-      return result;
-    }
-    for (int i = 0; i < segments.length; i++) {
-      String segment = segments[i];
-      final String[] elements = StringUtils.split(segment, elementSeparator);
-      if (Objects.isNull(elements)) {
-        continue;
-      }
-      String seg = elements[0];
-      if (i == 0) {
-        parseISA(seg, elements, result);
-      }
-      if (i == segments.length - 1) {
-        parseIEA(seg, elements, result);
-      }
+  public Map<String, String[]> simpleParse(String content) {
+    Map<String, String[]> result = Maps.newLinkedHashMap();
+    final String[] lines = StringUtils.split(content, segmentSeparator);
+    for (String line : lines) {
+      final String[] elements = StringUtils.split(replaceCrLf(line), elementSeparator);
+      String segId = elements[0];
+      result.put(segId, elements);
     }
     return result;
   }
 
-  private void parseISA(String seg, String[] elements, Map<String, Object> result) {
-    if (!X12Segment.ISA.name().equals(seg)) {
-      validationMessages.addMessage(X12Segment.ISA.name(), ValidationType.FileContent.name(),
-          "Missing segment ISA");
-      return;
+  public Map<String, Object> parseToMap(String content) {
+    Map<String, Object> result = Maps.newLinkedHashMap();
+    ArrayDeque<Map<String, Object>> lineInCreationDeque = new ArrayDeque<>();
+    ArrayDeque<String> loopInCreationDeque = new ArrayDeque<>();
+    lineInCreationDeque.add(result);
+    final String[] lines = StringUtils.split(content, segmentSeparator);
+    for (String line : lines) {
+      handleLine(line, lineInCreationDeque, loopInCreationDeque);
     }
-    final HashMap<String, Object> interchange = Maps.newLinkedHashMap();
-    interchange.put(X12Segment.ISA.name(), elements);
-    result.put(INTERCHANGE, interchange);
+    return result;
   }
 
-  private void parseIEA(String seg, String[] elements, Map<String, Object> result) {
-    if (!X12Segment.IEA.name().equals(seg)) {
-      validationMessages.addMessage(X12Segment.IEA.name(), ValidationType.FileContent.name(),
-          "Missing segment IEA");
-      return;
+  private void handleLine(String line,
+      ArrayDeque<Map<String, Object>> lineInCreationDeque,
+      ArrayDeque<String> loopInCreationDeque) {
+    final String[] elements = StringUtils.split(replaceCrLf(line), elementSeparator);
+    String segId = elements[0];
+    if (INTERCHANGE_CONTROL_HEADER_TAG.equals(segId)
+        || FUNCTIONAL_GROUP_HEADER_TAG.equals(segId)
+        || TRANSACTION_SET_HEADER_TAG.equals(segId)) {
+      pushLine(KEY_MAP.get(segId), segId, elements, lineInCreationDeque);
+    } else if (INTERCHANGE_CONTROL_TRAILER_TAG.equals(segId)
+        || FUNCTIONAL_GROUP_TRAILER_TAG.equals(segId)
+        || TRANSACTION_SET_TRAILER_TAG.equals(segId)) {
+      breakLoopIfNeed(segId, lineInCreationDeque, loopInCreationDeque);
+      putLine(segId, elements, lineInCreationDeque);
+      lineInCreationDeque.pop();
+    } else if (loopConfig.containsKey(segId)) {
+      breakLoopIfNeed(segId, lineInCreationDeque, loopInCreationDeque);
+      handleLoop(segId, elements, lineInCreationDeque, loopInCreationDeque);
+    } else {
+      breakLoopIfNeed(segId, lineInCreationDeque, loopInCreationDeque);
+      putLine(segId, elements, lineInCreationDeque);
     }
-    final HashMap<String, Object> interchange = (HashMap<String, Object>) result.get(
-        INTERCHANGE);
-    interchange.put(X12Segment.IEA.name(), elements);
   }
 
+  private void handleLoop(String segId, String[] elements,
+      ArrayDeque<Map<String, Object>> lineInCreationDeque,
+      ArrayDeque<String> loopInCreationDeque) {
+    final String loop = loopConfig.get(segId);
+    if (loopInCreationDeque.contains(loop)) {
+      lineInCreationDeque.pop();
+    } else {
+      loopInCreationDeque.push(loop);
+    }
+    pushLine(loop, segId, elements, lineInCreationDeque);
+  }
+
+  private void breakLoopIfNeed(String segId,
+      ArrayDeque<Map<String, Object>> lineInCreationDeque,
+      ArrayDeque<String> loopInCreationDeque) {
+    for (String loop : loopInCreationDeque) {
+      if (!loopConfig.get(loop).contains(segId)) {
+        lineInCreationDeque.pop();
+        loopInCreationDeque.pop();
+      }
+    }
+  }
+
+  private void pushLine(String key, String segId, String[] elements,
+      ArrayDeque<Map<String, Object>> lineInCreationDeque) {
+    final List<Map<String, Object>> list = (List<Map<String, Object>>)
+        Objects.requireNonNull(lineInCreationDeque.peek())
+            .computeIfAbsent(key, id -> new ArrayList<>());
+    Map<String, Object> item = Maps.newLinkedHashMap();
+    item.put(segId, elements);
+    list.add(item);
+    lineInCreationDeque.push(item);
+  }
+
+  private void putLine(String segId, String[] elements,
+      ArrayDeque<Map<String, Object>> lineInCreationDeque) {
+    Objects.requireNonNull(lineInCreationDeque.peek()).put(segId, elements);
+  }
+
+  private String replaceCrLf(String line) {
+    return StringUtils.replaceEach(line,
+        new String[]{StringUtils.CR, StringUtils.LF},
+        new String[]{StringUtils.EMPTY, StringUtils.EMPTY});
+  }
 }
